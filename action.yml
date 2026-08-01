@@ -106,13 +106,22 @@ runs:
               host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
 
               # This writes the daemon's netrc, because substitution runs in the daemon and ~/.netrc is
-              # invisible to it. It writes nix.custom.conf because Determinate manages nix.conf.
+              # invisible to it, and nix.custom.conf, because Determinate manages nix.conf.
+              #
+              # why the netrc path is discovered rather than hardcoded: Determinate Nix re-sets
+              # netrc-file AFTER it includes nix.custom.conf, so a netrc-file written into
+              # nix.custom.conf never wins and the daemon reads Determinate's own netrc (commonly
+              # /nix/var/determinate/netrc). Asking Nix for the effective path and writing the
+              # credential there is what makes this job's cache reads authenticate instead of returning
+              # 401 and silently falling through to the upstream cache.
+              netrc_path="$(nix config show netrc-file 2>/dev/null || true)"
+              [ -n "${netrc_path}" ] || netrc_path=/etc/nix/netrc
               printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                | sudo tee /etc/nix/netrc >/dev/null
-              sudo chmod 600 /etc/nix/netrc
+                | sudo tee "${netrc_path}" >/dev/null
+              sudo chmod 600 "${netrc_path}"
 
               {
-                echo "netrc-file = /etc/nix/netrc"
+                echo "netrc-file = ${netrc_path}"
                 echo "extra-substituters = ${CACHET_CACHE_URL}"
                 if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
                   echo "extra-trusted-public-keys = ${CACHET_TRUSTED_PUBLIC_KEY}"

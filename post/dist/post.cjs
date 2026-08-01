@@ -451,8 +451,8 @@ async function withRetries(what, attempt, sleep) {
 }
 
 // action/post/src/real/upload.ts
-function headers(target, extra = {}) {
-  return { Authorization: `Bearer ${target.token}`, ...extra };
+function authHeaders(token, extra = {}) {
+  return { Authorization: `Bearer ${token}`, ...extra };
 }
 function objectUrl(target, key, query = "") {
   return `${target.cacheUrl.replace(/\/+$/, "")}/${key}${query}`;
@@ -466,23 +466,27 @@ async function putWhole(target, plan) {
     return bytes;
   }
   return withRetriesUsingRealSleep(`PUT ${plan.object.key}`, async () => {
+    const token = await target.mintToken();
+    if (!token.ok) {
+      return token;
+    }
     const response = await fetch(objectUrl(target, plan.object.key), {
       method: "PUT",
-      headers: headers(target, { "Content-Length": String(plan.object.sizeBytes) }),
+      headers: authHeaders(token.value, { "Content-Length": String(plan.object.sizeBytes) }),
       body: new Uint8Array(bytes.value)
     });
     return response.ok ? ok(undefined) : fail(`${String(response.status)} ${await response.text()}`);
   });
 }
-async function putInParts(target, plan) {
-  const bytes = await readStagedFile(plan.object.filePath);
-  if (!bytes.ok) {
-    return bytes;
-  }
-  const created = await withRetriesUsingRealSleep(`begin ${plan.object.key}`, async () => {
+async function beginUpload(target, plan) {
+  return withRetriesUsingRealSleep(`begin ${plan.object.key}`, async () => {
+    const token = await target.mintToken();
+    if (!token.ok) {
+      return token;
+    }
     const response = await fetch(objectUrl(target, plan.object.key, "?uploads"), {
       method: "POST",
-      headers: headers(target, {
+      headers: authHeaders(token.value, {
         [UPLOAD_TOTAL_BYTES_HEADER]: String(plan.object.sizeBytes)
       })
     });
@@ -491,54 +495,87 @@ async function putInParts(target, plan) {
     }
     return ok(await response.json());
   });
+}
+async function uploadOnePart(target, plan, uploadId, partNumber, bytes) {
+  const offset = (partNumber - 1) * plan.partBytes;
+  const length = partNumber === plan.expectedParts ? plan.finalPartBytes : plan.partBytes;
+  const slice = new Uint8Array(bytes.subarray(offset, offset + length));
+  const query = `?uploadId=${uploadId}&partNumber=${String(partNumber)}`;
+  return withRetriesUsingRealSleep(`part ${String(partNumber)} of ${plan.object.key}`, async () => {
+    const token = await target.mintToken();
+    if (!token.ok) {
+      return token;
+    }
+    const response = await fetch(objectUrl(target, plan.object.key, query), {
+      method: "PUT",
+      headers: authHeaders(token.value, { "Content-Length": String(length) }),
+      body: slice
+    });
+    if (!response.ok) {
+      return fail(`${String(response.status)} ${await response.text()}`);
+    }
+    return ok(await response.json());
+  });
+}
+async function completeUpload(target, plan, uploadId, parts) {
+  return withRetriesUsingRealSleep(`complete ${plan.object.key}`, async () => {
+    const token = await target.mintToken();
+    if (!token.ok) {
+      return token;
+    }
+    const response = await fetch(objectUrl(target, plan.object.key, `?uploadId=${uploadId}`), {
+      method: "POST",
+      headers: authHeaders(token.value, { "Content-Type": "application/json" }),
+      body: JSON.stringify(parts)
+    });
+    return response.ok ? ok(undefined) : fail(`${String(response.status)} ${await response.text()}`);
+  });
+}
+async function abortUpload(target, plan, uploadId) {
+  const token = await target.mintToken();
+  if (!token.ok) {
+    return;
+  }
+  await fetch(objectUrl(target, plan.object.key, `?uploadId=${uploadId}`), {
+    method: "DELETE",
+    headers: authHeaders(token.value)
+  }).catch(() => {
+    return;
+  });
+}
+async function putInParts(target, plan) {
+  const bytes = await readStagedFile(plan.object.filePath);
+  if (!bytes.ok) {
+    return bytes;
+  }
+  const created = await beginUpload(target, plan);
   if (!created.ok) {
     return created;
   }
   const { uploadId } = created.value;
   const parts = [];
   for (let partNumber = 1;partNumber <= plan.expectedParts; partNumber += 1) {
-    const offset = (partNumber - 1) * plan.partBytes;
-    const length = partNumber === plan.expectedParts ? plan.finalPartBytes : plan.partBytes;
-    const slice = new Uint8Array(bytes.value.subarray(offset, offset + length));
-    const sent = await withRetriesUsingRealSleep(`part ${String(partNumber)} of ${plan.object.key}`, async () => {
-      const response = await fetch(objectUrl(target, plan.object.key, `?uploadId=${uploadId}&partNumber=${String(partNumber)}`), {
-        method: "PUT",
-        headers: headers(target, { "Content-Length": String(length) }),
-        body: slice
-      });
-      if (!response.ok) {
-        return fail(`${String(response.status)} ${await response.text()}`);
-      }
-      return ok(await response.json());
-    });
+    const sent = await uploadOnePart(target, plan, uploadId, partNumber, bytes.value);
     if (!sent.ok) {
-      await fetch(objectUrl(target, plan.object.key, `?uploadId=${uploadId}`), {
-        method: "DELETE",
-        headers: headers(target)
-      }).catch(() => {
-        return;
-      });
+      await abortUpload(target, plan, uploadId);
       return sent;
     }
     parts.push(sent.value);
   }
-  return withRetriesUsingRealSleep(`complete ${plan.object.key}`, async () => {
-    const response = await fetch(objectUrl(target, plan.object.key, `?uploadId=${uploadId}`), {
-      method: "POST",
-      headers: headers(target, { "Content-Type": "application/json" }),
-      body: JSON.stringify(parts)
-    });
-    return response.ok ? ok(undefined) : fail(`${String(response.status)} ${await response.text()}`);
-  });
+  return completeUpload(target, plan, uploadId, parts);
 }
 async function uploadObject(target, plan) {
   return plan.kind === "single" ? putWhole(target, plan) : putInParts(target, plan);
 }
 async function postRoots(target, project, storePaths, installables) {
   return withRetriesUsingRealSleep(`renew the lease for ${project}`, async () => {
+    const token = await target.mintToken();
+    if (!token.ok) {
+      return token;
+    }
     const response = await fetch(`${target.cacheUrl.replace(/\/+$/, "")}/roots/${project}`, {
       method: "POST",
-      headers: headers(target, { "Content-Type": "application/json" }),
+      headers: authHeaders(token.value, { "Content-Type": "application/json" }),
       body: JSON.stringify({ storePaths, installables })
     });
     return response.ok ? ok(undefined) : fail(`${String(response.status)} ${await response.text()}`);
@@ -613,13 +650,16 @@ async function push(inputs) {
   if (filtered.toPush.length === 0) {
     return;
   }
-  const token = await requestIdToken(inputs.audience, process.env);
-  if (!token.ok) {
-    process.stderr.write(`cachet: ${token.message}
+  const probe = await requestIdToken(inputs.audience, process.env);
+  if (!probe.ok) {
+    process.stderr.write(`cachet: ${probe.message}
 `);
     return;
   }
-  const target = { cacheUrl: inputs.cacheUrl, token: token.value };
+  const target = {
+    cacheUrl: inputs.cacheUrl,
+    mintToken: () => requestIdToken(inputs.audience, process.env)
+  };
   const uploaded = await stageAndUpload(inputs, target, filtered.toPush);
   if (!uploaded.ok) {
     process.stderr.write(`cachet: ${uploaded.message}
