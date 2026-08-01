@@ -171,4 +171,10 @@ runs:
         # The nested JavaScript action: its main step snapshots the store, and its post step, on success
         # only, does the push. It takes no inputs, because the step above resolved all of them into the
         # job environment.
-        - uses: ./post
+        # why: the full owner/repo/path@ref form rather than `./post`. A composite action resolves a
+        # relative `./post` against the consumer's GITHUB_WORKSPACE rather than this action's own
+        # directory, so a cross-repo consumer looked for `<workspace>/post` and failed with "Can't find
+        # 'action.yml' under .../post". Naming the repository resolves the nested action independently of
+        # where the consumer checked out. It is pinned to the v1 major tag, which every release in the 1.x
+        # line moves forward, so the composite and its post action always come from the same line.
+        - uses: agx-runtime/cachet-action/post@v1
