@@ -20,8 +20,8 @@ inputs:
         default: ''
     signing-key:
         description: >-
-            The NAR signing key. The only org-level secret cachet needs — pass
-            ${{ secrets.CACHET_SIGNING_KEY }}. Nix signs with it on this runner; it never reaches the cache.
+            The NAR signing key, and the only org-level secret cachet needs. Pass the
+            CACHET_SIGNING_KEY secret. Nix signs with it on this runner; it never reaches the cache.
         required: true
     cache-url:
         description: The cache's base URL.
