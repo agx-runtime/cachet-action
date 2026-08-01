@@ -1,0 +1,18 @@
+name: cachet-push
+description: >-
+    Snapshots the Nix store, then on job success pushes what was added and renews the lease. Not meant to
+    be used directly — the cachet-setup composite action wraps it.
+
+# why: no inputs. The cachet-setup composite resolves every value and exports it to the job environment,
+# which is what both this action's steps read. Declaring them here as well would give the post step a
+# second, differently-named source of the same configuration (GitHub exposes an input as `INPUT_<NAME>`,
+# not as the name the code reads), and that mismatch is exactly the bug that made this step decline to
+# push on every run while reporting success.
+
+runs:
+    using: node20
+    main: dist/main.cjs
+    post: dist/post.cjs
+    # why: on success only. A failed build must never populate the cache or refresh a lease — that is what
+    # keeps a broken artifact from becoming the one everybody substitutes.
+    post-if: success()

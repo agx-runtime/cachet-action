@@ -1,0 +1,174 @@
+# This is the published, public copy of the cachet-setup action. GitHub blocks a public repository
+# from consuming an action that lives in a private one, and cachet is private, so a public consumer
+# (for example agx-runtime/substrate-kernels) needs the action to live in a public repository. The
+# canonical source and the build that produces post/dist/*.cjs live in the private agx-runtime/cachet
+# repository under action/; a change is made there and copied here, so any drift is traceable to that
+# one source.
+name: cachet-setup
+description: >-
+    Install Determinate Nix, wire this job into the cachet binary cache, and push what the job builds.
+author: loopholelabs
+# A composite action cannot declare a post step, which is why the push lives in a nested JavaScript
+# action below. This is the same shape cachix/cachix-action uses, for the same reason.
+
+inputs:
+    roots:
+        description: >-
+            Flake installables whose closures this project needs. Their outputs are pushed unconditionally
+            and, on the default branch, become the project's garbage-collection lease.
+        required: false
+        default: ''
+    signing-key:
+        description: >-
+            The NAR signing key. The only org-level secret cachet needs — pass
+            ${{ secrets.CACHET_SIGNING_KEY }}. Nix signs with it on this runner; it never reaches the cache.
+        required: true
+    cache-url:
+        description: The cache's base URL.
+        required: false
+        # A metadata default, which is the one place a deployment hostname may appear (ADR 0013).
+        default: https://pkg-cache.loopholelabs.io
+    audience:
+        description: The OIDC audience the cache requires.
+        required: false
+        default: cachet
+    project:
+        description: >-
+            The lease name for this repository. Defaults to the owner and name joined by a hyphen
+            (`my-org-my-repo`), which is unique across the organisations this cache serves — two
+            repositories sharing a name would otherwise share a lease and overwrite each other's.
+        required: false
+        default: ''
+    upstream-url:
+        description: The upstream cache to filter against before pushing.
+        required: false
+        default: https://cache.nixos.org
+    default-branch-ref:
+        description: >-
+            The ref permitted to renew the lease. The cache enforces this itself; this input only avoids a
+            request that would be refused.
+        required: false
+        default: refs/heads/main
+    trusted-public-key:
+        description: >-
+            The public half of the signing key, in Nix's `name:base64` form, so this job can verify what it
+            substitutes from the cache.
+        required: false
+        # A metadata default, like `cache-url` above: the public key is deployment identity, not a
+        # secret, and ADR 0013 makes action metadata the one place deployment identity may appear.
+        # Without a default here every consuming repository would have to learn and paste the key,
+        # and one that forgot would fail signature verification on every substitution — which Nix
+        # reports as a cache miss, so the job would silently compile from source while the cache
+        # looked healthy. The login script bakes in the same value (`public_key_default` in
+        # scripts/cache-login.sh), so a laptop and a runner learn the key the same way.
+        default: pkg-cache.loopholelabs.io-1:JC2XK3HyAUXteubthi/pUEM0iokE6YyOGFURMB4hsRE=
+    push:
+        description: Set to false to use the cache read-only.
+        required: false
+        default: 'true'
+    determinate-nix-action-version:
+        description: Which release of the Determinate Nix installer action to use.
+        required: false
+        default: v3
+
+runs:
+    using: composite
+    steps:
+        # Determinate Nix is the one distribution everywhere, including on laptops (ADR 0008).
+        - uses: DeterminateSystems/determinate-nix-action@v3.21.8
+
+        - name: Configure cachet
+          shell: bash
+          env:
+              CACHET_CACHE_URL: ${{ inputs.cache-url }}
+              CACHET_AUDIENCE: ${{ inputs.audience }}
+              CACHET_TRUSTED_PUBLIC_KEY: ${{ inputs.trusted-public-key }}
+              CACHET_SIGNING_KEY: ${{ inputs.signing-key }}
+              CACHET_PROJECT: ${{ inputs.project }}
+              CACHET_ROOTS: ${{ inputs.roots }}
+              CACHET_UPSTREAM_URL: ${{ inputs.upstream-url }}
+              CACHET_DEFAULT_BRANCH_REF: ${{ inputs.default-branch-ref }}
+              CACHET_PUSH: ${{ inputs.push }}
+          run: |
+              set -euo pipefail
+
+              # The token authenticates this job for reads as well as writes: nothing is stored, nothing
+              # rotates, and the runner is authorised because it is provably ours (docs/contracts.md).
+              if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                echo "cachet: this job cannot mint an OIDC token." >&2
+                echo "  Add 'permissions: { contents: read, id-token: write }' to the job." >&2
+                exit 1
+              fi
+              token="$(curl -fsSL \
+                -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CACHET_AUDIENCE}" | jq -r '.value')"
+
+              host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
+
+              # This writes the daemon's netrc, because substitution runs in the daemon and ~/.netrc is
+              # invisible to it. It writes nix.custom.conf because Determinate manages nix.conf.
+              printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
+                | sudo tee /etc/nix/netrc >/dev/null
+              sudo chmod 600 /etc/nix/netrc
+
+              {
+                echo "netrc-file = /etc/nix/netrc"
+                echo "extra-substituters = ${CACHET_CACHE_URL}"
+                if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
+                  echo "extra-trusted-public-keys = ${CACHET_TRUSTED_PUBLIC_KEY}"
+                fi
+              } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
+              sudo chmod 644 /etc/nix/nix.custom.conf
+
+              sudo systemctl restart nix-daemon 2>/dev/null \
+                || sudo launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null \
+                || true
+
+              # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
+              key_file="${RUNNER_TEMP}/cachet-signing.key"
+              printf '%s' "${CACHET_SIGNING_KEY}" > "${key_file}"
+              chmod 600 "${key_file}"
+              echo "CACHET_SIGNING_KEY_FILE=${key_file}" >> "${GITHUB_ENV}"
+
+              # Everything the post step reads is exported to the job environment here, and this is the
+              # only place any of it is resolved. A step-level `env:` block is scoped to the step it sits
+              # on, so passing these to the nested action as `with:` inputs left the post step reading
+              # empty strings and declining to push, silently, on every run.
+              #
+              # The project name defaults to owner-and-name rather than the bare repository name.
+              #
+              # why: this cache serves more than one organisation, so two repositories can share a name.
+              # A lease is filed under the project name and a renewal replaces the previous document
+              # wholesale, so two same-named repositories defaulting to one project would overwrite each
+              # other's lease — and each would then stop protecting the other's closure, making live
+              # paths collectable (Invariant GC-NEVER-EATS-THE-LIVING). Including the owner makes the
+              # default unique by construction rather than by everyone remembering to pass `project`.
+              project="${CACHET_PROJECT}"
+              if [ -z "${project}" ]; then
+                project="${GITHUB_REPOSITORY//\//-}"
+              fi
+              # why: the heredoc form rather than `NAME=value`. `roots` takes several installables and the
+              # post step splits it on any whitespace, so a caller writing them one per line with a YAML
+              # block scalar is using the documented shape — and a bare `NAME=value` line cannot express
+              # a newline. GitHub rejects the whole file with "Invalid format" when it sees the
+              # continuation, which fails the step for a reason that points nowhere near the cause.
+              #
+              # The delimiter is fixed and long enough not to occur in a flake installable, and the
+              # values here are action inputs rather than anything a request supplies.
+              env_file() {
+                printf '%s<<CACHET_EOF_1c7f\n%s\nCACHET_EOF_1c7f\n' "$1" "$2" >> "${GITHUB_ENV}"
+              }
+              env_file CACHET_CACHE_URL "${CACHET_CACHE_URL}"
+              env_file CACHET_AUDIENCE "${CACHET_AUDIENCE}"
+              env_file CACHET_PROJECT "${project}"
+              env_file CACHET_ROOTS "${CACHET_ROOTS}"
+              env_file CACHET_UPSTREAM_URL "${CACHET_UPSTREAM_URL}"
+              env_file CACHET_DEFAULT_BRANCH_REF "${CACHET_DEFAULT_BRANCH_REF}"
+              env_file CACHET_PUSH "${CACHET_PUSH}"
+
+              echo "cachet: configured ${CACHET_CACHE_URL} as a substituter for project ${project}"
+
+        # The nested JavaScript action: its main step snapshots the store, and its post step, on success
+        # only, does the push. It takes no inputs, because the step above resolved all of them into the
+        # job environment.
+        - uses: ./post
