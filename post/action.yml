@@ -10,7 +10,7 @@ description: >-
 # push on every run while reporting success.
 
 runs:
-    using: node20
+    using: node24
     main: dist/main.cjs
     post: dist/post.cjs
     # why: on success only. A failed build must never populate the cache or refresh a lease — that is what
