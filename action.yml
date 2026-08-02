@@ -74,6 +74,55 @@ inputs:
 runs:
     using: composite
     steps:
+        # Provision the cache read credential BEFORE Determinate is installed and its daemon starts.
+        # Determinate synthesizes the netrc the daemon reads (/nix/var/determinate/netrc) at daemon start,
+        # merging every file listed under authentication.additionalNetrcSources — and that start-up
+        # synthesis is the only reliable one on these runners. A later re-synthesis is gated on the FlakeHub
+        # login, whose transient failures otherwise leave cache reads at 401 and every build recompiling
+        # from source. Writing the credential and the config here, before the daemon exists, means its
+        # start-up synthesis merges the credential and the FlakeHub failure never gets to gate it
+        # (docs.determinate.systems, migrate-to-flakehub-cache).
+        - name: Provision the cachet read credential before Determinate starts
+          shell: bash
+          env:
+              CACHET_CACHE_URL: ${{ inputs.cache-url }}
+              CACHET_AUDIENCE: ${{ inputs.audience }}
+          run: |
+              set -euo pipefail
+
+              # The OIDC token authenticates this job; nothing is stored and the runner is authorised
+              # because it is provably ours (docs/contracts.md). This is minted here, without Nix, because
+              # Determinate is not installed yet.
+              if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                echo "cachet: this job cannot mint an OIDC token." >&2
+                echo "  Add 'permissions: { contents: read, id-token: write }' to the job." >&2
+                exit 1
+              fi
+              token="$(curl -fsSL \
+                -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CACHET_AUDIENCE}" | jq -r '.value')"
+              host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
+
+              # The credential file: real, outside the Nix store, 0600, root-owned, as Determinate requires.
+              sudo mkdir -p /etc/nix /etc/determinate
+              printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
+                | sudo tee /etc/nix/netrc >/dev/null
+              sudo chmod 600 /etc/nix/netrc
+
+              # Register it under authentication.additionalNetrcSources. Determinate is not installed yet,
+              # so the config usually does not exist; merge with jq when it does so anything the installer
+              # pre-seeds survives.
+              if [ -f /etc/determinate/config.json ]; then
+                sudo cat /etc/determinate/config.json \
+                  | jq '.authentication.additionalNetrcSources = ((.authentication.additionalNetrcSources // []) + ["/etc/nix/netrc"] | unique)' \
+                  | sudo tee /etc/determinate/config.json.tmp >/dev/null
+                sudo mv /etc/determinate/config.json.tmp /etc/determinate/config.json
+              else
+                printf '{"authentication":{"additionalNetrcSources":["/etc/nix/netrc"]}}\n' \
+                  | sudo tee /etc/determinate/config.json >/dev/null
+              fi
+              echo "cachet: read credential provisioned before Determinate starts"
+
         # Determinate Nix is the one distribution everywhere, including on laptops (ADR 0008).
         - uses: DeterminateSystems/determinate-nix-action@v3.21.8
 
@@ -92,47 +141,11 @@ runs:
           run: |
               set -euo pipefail
 
-              # The token authenticates this job for reads as well as writes: nothing is stored, nothing
-              # rotates, and the runner is authorised because it is provably ours (docs/contracts.md).
-              if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-                echo "cachet: this job cannot mint an OIDC token." >&2
-                echo "  Add 'permissions: { contents: read, id-token: write }' to the job." >&2
-                exit 1
-              fi
-              token="$(curl -fsSL \
-                -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CACHET_AUDIENCE}" | jq -r '.value')"
+              # The read credential and its Determinate config were provisioned before the daemon started
+              # (the first step of this action), so the daemon's start-up synthesis already merged the
+              # credential into the netrc it reads. There is nothing to do here for the netrc.
 
-              host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
-
-              # The daemon that performs substitution reads only Determinate's synthesized netrc at
-              # /nix/var/determinate/netrc. Determinate hardcodes `netrc-file` to that path in
-              # /etc/nix/nix.conf AFTER the `!include nix.custom.conf` line, and `netrc-file` is a scalar
-              # that the later line overrides, so a netrc-file set in nix.custom.conf is silently dead
-              # (docs.determinate.systems, migrate-to-flakehub-cache). The supported way to add a
-              # credential is a real file — outside the Nix store, 0600, root-owned — registered under
-              # authentication.additionalNetrcSources, which Determinate merges into the synthesized netrc
-              # every time it synthesizes it.
-              netrc_source=/etc/nix/netrc
-              printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                | sudo tee "${netrc_source}" >/dev/null
-              sudo chmod 600 "${netrc_source}"
-
-              det_config=/etc/determinate/config.json
-              sudo mkdir -p /etc/determinate
-              if [ -f "${det_config}" ]; then
-                # Merge with jq so a builder or garbageCollector section the runner already carries survives.
-                sudo cat "${det_config}" \
-                  | jq --arg s "${netrc_source}" '.authentication.additionalNetrcSources = ((.authentication.additionalNetrcSources // []) + [$s] | unique)' \
-                  | sudo tee "${det_config}.tmp" >/dev/null
-                sudo mv "${det_config}.tmp" "${det_config}"
-              else
-                printf '{"authentication":{"additionalNetrcSources":["%s"]}}\n' "${netrc_source}" \
-                  | sudo tee "${det_config}" >/dev/null
-              fi
-
-              # The substituter and trusted key belong in nix.custom.conf, which Determinate includes for
-              # the daemon. This goes in before the restart so the reload below also picks up the cache.
+              # Add the substituter and trusted key, which the daemon reads from nix.custom.conf.
               {
                 echo "extra-substituters = ${CACHET_CACHE_URL}"
                 if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
@@ -141,35 +154,14 @@ runs:
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
 
-              # The daemon reads only Determinate's synthesized /nix/var/determinate/netrc and caches it, so
-              # writing the credential straight into that file does nothing — the daemon keeps its loaded
-              # copy and returns 401 (confirmed: a direct write landed but the build still compiled). The
-              # credential reaches the daemon only when Determinate re-synthesizes the file, merging the
-              # source registered above, and reloads. A daemon restart does that: systemctl or launchctl on
-              # a real system, and on the nscloud images here — which have neither — `determinate-nixd init`
-              # regenerates the merged netrc and reloads the daemon. The macOS label is
-              # systems.determinate.nix-daemon, not org.nixos.nix-daemon.
-              sudo systemctl restart nix-daemon.service 2>/dev/null \
-                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
-                || sudo determinate-nixd init 2>/dev/null \
-                || true
-
-              # Wait for the re-synthesis to land the credential before the build substitutes. The restart
-              # is asynchronous, and starting before it finished is exactly what raced earlier: the build
-              # hit cachet unauthenticated, took a 401, and cached that miss in Nix's in-memory negative
-              # cache — which ignores narinfo-cache-negative-ttl and does not expire — so every path then
-              # rebuilt from source for the rest of the job. Polling until the credential is in the netrc
-              # the daemon reads removes the race; it is not a fail-loud check, it is waiting for an
-              # asynchronous restart to finish.
-              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
-              [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
-              for _ in $(seq 1 60); do
-                sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null && break
-                sleep 1
-              done
+              # Confirm the daemon's netrc authenticates against cachet, so a regression shows up in the log
+              # rather than as a silent rebuild. A 404 means the credential is present and authenticated —
+              # the probed path is simply absent — while a 401 means the start-up synthesis did not merge
+              # it, most likely because the installer overwrote the config this action pre-seeded.
+              daemon_netrc="$(nix config show netrc-file 2>/dev/null || echo /nix/var/determinate/netrc)"
               probe_code="$(curl -s -o /dev/null -w '%{http_code}' --netrc-file "${daemon_netrc}" \
                 "${CACHET_CACHE_URL%/}/0000000000000000000000000000000a.narinfo" 2>/dev/null || echo 000)"
-              echo "cachet: read credential synthesized into ${daemon_netrc}; auth probe returned ${probe_code} (404 = authenticated, 401 = not)"
+              echo "cachet: daemon netrc auth probe returned ${probe_code} (404 = authenticated, 401 = not)"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
