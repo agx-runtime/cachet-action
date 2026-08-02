@@ -160,16 +160,13 @@ runs:
               # written here: a substituter added after the daemon has started is never consulted, which is
               # why the last run authenticated yet never queried cachet.
 
-              # Confirm the daemon can read from cachet, and — temporarily — dump the effective substituter
-              # set and trusted keys, because the last run's auth probe was 404 yet the build queried cachet
-              # zero times. Removed once reads work.
+              # Confirm the daemon's netrc authenticates against cachet, so a regression surfaces in the log
+              # rather than as a silent rebuild: a 404 means the credential is present and authenticated —
+              # the probed path is simply absent — while a 401 means it is not.
               daemon_netrc="$(nix config show netrc-file 2>/dev/null || echo /nix/var/determinate/netrc)"
               probe_code="$(curl -s -o /dev/null -w '%{http_code}' --netrc-file "${daemon_netrc}" \
                 "${CACHET_CACHE_URL%/}/0000000000000000000000000000000a.narinfo" 2>/dev/null || echo 000)"
-              echo "cachet: auth probe ${probe_code} (404 = authenticated, 401 = not)"
-              echo "cachet-diag substituters: $(nix config show substituters)"
-              echo "cachet-diag trusted-users: $(nix config show trusted-users)"
-              echo "cachet-diag cachet-key-present: $(nix config show trusted-public-keys | tr ' ' '\n' | grep -c pkg-cache || true)"
+              echo "cachet: read auth probe returned ${probe_code} (404 = authenticated, 401 = not)"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
