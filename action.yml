@@ -125,6 +125,16 @@ runs:
 
         # Determinate Nix is the one distribution everywhere, including on laptops (ADR 0008).
         - uses: DeterminateSystems/determinate-nix-action@v3.21.8
+          with:
+              # Add the cache and its trusted key at install time, so the daemon starts already knowing
+              # them. Adding them afterwards in the Configure step proved ineffective — the daemon never
+              # queried cachet at all — because a substituter and its trusted key reach the daemon only when
+              # it reads its config at start. extra-substituters and extra-trusted-public-keys accumulate
+              # (they use the extra- prefix), so this adds cachet alongside cache.nixos.org rather than
+              # replacing it.
+              extra-conf: |
+                  extra-substituters = ${{ inputs.cache-url }}
+                  extra-trusted-public-keys = ${{ inputs.trusted-public-key }}
 
         - name: Configure cachet
           shell: bash
@@ -145,23 +155,21 @@ runs:
               # (the first step of this action), so the daemon's start-up synthesis already merged the
               # credential into the netrc it reads. There is nothing to do here for the netrc.
 
-              # Add the substituter and trusted key, which the daemon reads from nix.custom.conf.
-              {
-                echo "extra-substituters = ${CACHET_CACHE_URL}"
-                if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
-                  echo "extra-trusted-public-keys = ${CACHET_TRUSTED_PUBLIC_KEY}"
-                fi
-              } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
-              sudo chmod 644 /etc/nix/nix.custom.conf
+              # The substituter and trusted key are added at install time now (the extra-conf on the
+              # determinate-nix-action step above), so the daemon starts already knowing them. They are not
+              # written here: a substituter added after the daemon has started is never consulted, which is
+              # why the last run authenticated yet never queried cachet.
 
-              # Confirm the daemon's netrc authenticates against cachet, so a regression shows up in the log
-              # rather than as a silent rebuild. A 404 means the credential is present and authenticated —
-              # the probed path is simply absent — while a 401 means the start-up synthesis did not merge
-              # it, most likely because the installer overwrote the config this action pre-seeded.
+              # Confirm the daemon can read from cachet, and — temporarily — dump the effective substituter
+              # set and trusted keys, because the last run's auth probe was 404 yet the build queried cachet
+              # zero times. Removed once reads work.
               daemon_netrc="$(nix config show netrc-file 2>/dev/null || echo /nix/var/determinate/netrc)"
               probe_code="$(curl -s -o /dev/null -w '%{http_code}' --netrc-file "${daemon_netrc}" \
                 "${CACHET_CACHE_URL%/}/0000000000000000000000000000000a.narinfo" 2>/dev/null || echo 000)"
-              echo "cachet: daemon netrc auth probe returned ${probe_code} (404 = authenticated, 401 = not)"
+              echo "cachet: auth probe ${probe_code} (404 = authenticated, 401 = not)"
+              echo "cachet-diag substituters: $(nix config show substituters)"
+              echo "cachet-diag trusted-users: $(nix config show trusted-users)"
+              echo "cachet-diag cachet-key-present: $(nix config show trusted-public-keys | tr ' ' '\n' | grep -c pkg-cache || true)"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
