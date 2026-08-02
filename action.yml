@@ -141,28 +141,35 @@ runs:
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
 
-              # Re-run Determinate's boot init so determinate-nixd re-reads config.json and re-synthesizes
-              # the netrc the daemon reads with the registered source folded in. The GitHub-hosted and
-              # nscloud runners have no systemd — determinate-nixd runs nix-daemon directly — so `init` is
-              # the mechanism that applies config here, verified on the runner where systemctl reported
-              # "System has not been booted with systemd". The systemctl and launchctl lines cover a
-              # systemd host and a launchd host.
+              # Apply the credential to the netrc the daemon actually reads, then verify it is there
+              # before the build runs. determinate-nixd combines authentication.additionalNetrcSources
+              # into that netrc when it synthesizes it, and `init` re-runs the synthesis on a runner with
+              # no systemd. That alone proved racy: some matrix cells received the credential and some did
+              # not, and a cell that did not silently recompiled from source a kernel cachet already held,
+              # because Nix reads a 401 as a cache miss and falls through to building. So this loop
+              # confirms the credential is present in the daemon's netrc, appends it directly when a
+              # synthesis dropped it, and the job fails loudly rather than waste an hour compiling what the
+              # cache could have served in a minute.
               sudo determinate-nixd init 2>/dev/null || true
-              sudo systemctl restart nix-daemon 2>/dev/null \
-                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
-                || true
-
-              # Belt and suspenders: write the credential straight into the netrc the daemon reads right
-              # now, in case init did not re-synthesize on this Determinate version. The daemon reads
-              # netrc-file per request and does not re-synthesize mid-build (confirmed on the runner), so a
-              # direct entry there authenticates immediately; config.json keeps the source registered, so a
-              # later synthesis re-adds the credential rather than dropping it.
-              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
-              if [ -n "${daemon_netrc}" ] && [ "${daemon_netrc}" != "${netrc_path}" ] \
-                && ! sudo grep -q "machine ${host} " "${daemon_netrc}" 2>/dev/null; then
+              read_ready=0
+              for attempt in 1 2 3 4 5 6; do
+                daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
+                [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
+                if sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null; then
+                  read_ready=1
+                  break
+                fi
                 printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                  | sudo tee -a "${daemon_netrc}" >/dev/null
+                  | sudo tee -a "${daemon_netrc}" >/dev/null 2>&1 || true
+                sleep 2
+              done
+              if [ "${read_ready}" != 1 ]; then
+                echo "cachet: could not place the cache read credential in the daemon netrc." >&2
+                echo "  Reads would return 401 and this job would compile from source instead of pulling" >&2
+                echo "  from cachet. Failing loudly rather than silently wasting the build." >&2
+                exit 1
               fi
+              echo "cachet: daemon read credential verified in ${daemon_netrc}"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
