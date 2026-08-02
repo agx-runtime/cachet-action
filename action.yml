@@ -105,23 +105,35 @@ runs:
 
               host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
 
-              # This writes the daemon's netrc, because substitution runs in the daemon and ~/.netrc is
-              # invisible to it, and nix.custom.conf, because Determinate manages nix.conf.
-              #
-              # why the netrc path is discovered rather than hardcoded: Determinate Nix re-sets
-              # netrc-file AFTER it includes nix.custom.conf, so a netrc-file written into
-              # nix.custom.conf never wins and the daemon reads Determinate's own netrc (commonly
-              # /nix/var/determinate/netrc). Asking Nix for the effective path and writing the
-              # credential there is what makes this job's cache reads authenticate instead of returning
-              # 401 and silently falling through to the upstream cache.
-              netrc_path="$(nix config show netrc-file 2>/dev/null || true)"
-              [ -n "${netrc_path}" ] || netrc_path=/etc/nix/netrc
+              # Determinate Nix re-synthesizes the netrc the daemon reads and re-sets netrc-file to point
+              # at it AFTER including nix.custom.conf, so a credential written into that synthesized file is
+              # wiped on the next daemon restart, and a netrc-file set in nix.custom.conf never wins. That
+              # is exactly why this job's cache reads were returning 401 and the build compiled the kernel
+              # from source instead of substituting it from cachet. determinate-nixd instead folds any file
+              # listed under authentication.additionalNetrcSources into the netrc it synthesizes and keeps
+              # it across restarts, so the credential is written to a file this step owns and registered
+              # there. This is the same mechanism scripts/cache-login.sh uses for a laptop.
+              netrc_path=/etc/nix/netrc
               printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
                 | sudo tee "${netrc_path}" >/dev/null
               sudo chmod 600 "${netrc_path}"
 
+              det_config=/etc/determinate/config.json
+              sudo mkdir -p /etc/determinate
+              if [ -f "${det_config}" ]; then
+                # Merge with jq so a builder or garbageCollector section the runner already carries survives.
+                sudo cat "${det_config}" \
+                  | jq --arg s "${netrc_path}" '.authentication.additionalNetrcSources = ((.authentication.additionalNetrcSources // []) + [$s] | unique)' \
+                  | sudo tee "${det_config}.tmp" >/dev/null
+                sudo mv "${det_config}.tmp" "${det_config}"
+              else
+                printf '{"authentication":{"additionalNetrcSources":["%s"]}}\n' "${netrc_path}" \
+                  | sudo tee "${det_config}" >/dev/null
+              fi
+
+              # The substituter and trusted key belong in nix.custom.conf, which Determinate includes;
+              # netrc-file does not, because Determinate manages the netrc the daemon actually reads.
               {
-                echo "netrc-file = ${netrc_path}"
                 echo "extra-substituters = ${CACHET_CACHE_URL}"
                 if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
                   echo "extra-trusted-public-keys = ${CACHET_TRUSTED_PUBLIC_KEY}"
@@ -129,8 +141,12 @@ runs:
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
 
+              # Restart the daemon so determinate-nixd re-synthesizes the netrc with the registered source
+              # folded in. determinate-nixd is the daemon itself, so restarting the service re-runs the
+              # synthesis; the two commands cover the systemd runner and a launchd host.
+              sudo systemctl restart determinate-nixd 2>/dev/null || true
               sudo systemctl restart nix-daemon 2>/dev/null \
-                || sudo launchctl kickstart -k system/org.nixos.nix-daemon 2>/dev/null \
+                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
                 || true
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
