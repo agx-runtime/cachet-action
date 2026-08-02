@@ -141,13 +141,28 @@ runs:
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
 
-              # Restart the daemon so determinate-nixd re-synthesizes the netrc with the registered source
-              # folded in. determinate-nixd is the daemon itself, so restarting the service re-runs the
-              # synthesis; the two commands cover the systemd runner and a launchd host.
-              sudo systemctl restart determinate-nixd 2>/dev/null || true
+              # Re-run Determinate's boot init so determinate-nixd re-reads config.json and re-synthesizes
+              # the netrc the daemon reads with the registered source folded in. The GitHub-hosted and
+              # nscloud runners have no systemd — determinate-nixd runs nix-daemon directly — so `init` is
+              # the mechanism that applies config here, verified on the runner where systemctl reported
+              # "System has not been booted with systemd". The systemctl and launchctl lines cover a
+              # systemd host and a launchd host.
+              sudo determinate-nixd init 2>/dev/null || true
               sudo systemctl restart nix-daemon 2>/dev/null \
                 || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
                 || true
+
+              # Belt and suspenders: write the credential straight into the netrc the daemon reads right
+              # now, in case init did not re-synthesize on this Determinate version. The daemon reads
+              # netrc-file per request and does not re-synthesize mid-build (confirmed on the runner), so a
+              # direct entry there authenticates immediately; config.json keeps the source registered, so a
+              # later synthesis re-adds the credential rather than dropping it.
+              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
+              if [ -n "${daemon_netrc}" ] && [ "${daemon_netrc}" != "${netrc_path}" ] \
+                && ! sudo grep -q "machine ${host} " "${daemon_netrc}" 2>/dev/null; then
+                printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
+                  | sudo tee -a "${daemon_netrc}" >/dev/null
+              fi
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
