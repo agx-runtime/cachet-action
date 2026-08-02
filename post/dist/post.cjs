@@ -278,6 +278,29 @@ async function filterAgainstUpstream(candidates, rootPaths, probe) {
   }
   return { toPush, upstreamHits, probeFailures, rootsKept: rootCandidates.length };
 }
+async function dropAlreadyCached(candidates, probe) {
+  const answers = await mapWithConcurrency(candidates, FILTER_CONCURRENCY_MAX, async (path) => {
+    const parsed = parseStorePath(path);
+    if (!parsed.ok) {
+      return { path, hasIt: undefined };
+    }
+    return { path, hasIt: await probe(String(parsed.value.hash)) };
+  });
+  const toUpload = [];
+  let cacheHits = 0;
+  let probeFailures = 0;
+  for (const answer of answers) {
+    if (answer.hasIt === true) {
+      cacheHits += 1;
+      continue;
+    }
+    if (answer.hasIt === undefined) {
+      probeFailures += 1;
+    }
+    toUpload.push(answer.path);
+  }
+  return { toUpload, cacheHits, probeFailures };
+}
 
 // src/core/routes/multipart.ts
 function planParts(totalBytes) {
@@ -416,6 +439,23 @@ async function probeUpstream(upstreamUrl, storePathHash) {
   try {
     const response = await fetch(`${upstreamUrl.replace(/\/+$/, "")}/${storePathHash}.narinfo`, {
       method: "HEAD"
+    });
+    if (response.status === 404) {
+      return false;
+    }
+    if (response.ok) {
+      return true;
+    }
+    return;
+  } catch {
+    return;
+  }
+}
+async function probeCache(cacheUrl, storePathHash, token) {
+  try {
+    const response = await fetch(`${cacheUrl.replace(/\/+$/, "")}/${storePathHash}.narinfo`, {
+      method: "HEAD",
+      headers: { Authorization: `Bearer ${token}` }
     });
     if (response.status === 404) {
       return false;
@@ -624,6 +664,27 @@ async function stageAndUpload(inputs, target, paths) {
   }
   return ok(uploaded);
 }
+async function filterAndUpload(inputs, target, candidates, rootPaths, probeToken) {
+  const filtered = await filterAgainstUpstream(candidates, rootPaths, (hash) => probeUpstream(inputs.upstreamUrl, hash));
+  process.stdout.write(`cachet: ${String(filtered.toPush.length)} not upstream, ${String(filtered.upstreamHits.length)} already upstream` + `${filtered.probeFailures > 0 ? `, ${String(filtered.probeFailures)} probes failed (kept)` : ""}
+`);
+  if (filtered.toPush.length === 0) {
+    return ok(undefined);
+  }
+  const notCached = await dropAlreadyCached(filtered.toPush, (hash) => probeCache(inputs.cacheUrl, hash, probeToken));
+  process.stdout.write(`cachet: ${String(notCached.toUpload.length)} new to cachet, ${String(notCached.cacheHits)} already cached` + `${notCached.probeFailures > 0 ? `, ${String(notCached.probeFailures)} probes failed (kept)` : ""}
+`);
+  if (notCached.toUpload.length === 0) {
+    return ok(undefined);
+  }
+  const uploaded = await stageAndUpload(inputs, target, notCached.toUpload);
+  if (!uploaded.ok) {
+    return uploaded;
+  }
+  process.stdout.write(`cachet: uploaded ${String(uploaded.value)} objects
+`);
+  return ok(undefined);
+}
 async function push(inputs) {
   const before = parseSnapshot(await readFileOrEmpty(snapshotPath(process.env)));
   const afterOutput = await run(["nix", "path-info", "--all"]);
@@ -643,13 +704,6 @@ async function push(inputs) {
 `);
     return;
   }
-  const rootPaths = await resolveRootPaths(inputs.rootInstallables);
-  const filtered = await filterAgainstUpstream(candidates.value, rootPaths, (hash) => probeUpstream(inputs.upstreamUrl, hash));
-  process.stdout.write(`cachet: ${String(filtered.toPush.length)} to push, ${String(filtered.upstreamHits.length)} already upstream` + `${filtered.probeFailures > 0 ? `, ${String(filtered.probeFailures)} probes failed (kept)` : ""}
-`);
-  if (filtered.toPush.length === 0) {
-    return;
-  }
   const probe = await requestIdToken(inputs.audience, process.env);
   if (!probe.ok) {
     process.stderr.write(`cachet: ${probe.message}
@@ -660,14 +714,13 @@ async function push(inputs) {
     cacheUrl: inputs.cacheUrl,
     mintToken: () => requestIdToken(inputs.audience, process.env)
   };
-  const uploaded = await stageAndUpload(inputs, target, filtered.toPush);
-  if (!uploaded.ok) {
-    process.stderr.write(`cachet: ${uploaded.message}
+  const rootPaths = await resolveRootPaths(inputs.rootInstallables);
+  const pushed = await filterAndUpload(inputs, target, candidates.value, rootPaths, probe.value);
+  if (!pushed.ok) {
+    process.stderr.write(`cachet: ${pushed.message}
 `);
     return;
   }
-  process.stdout.write(`cachet: uploaded ${String(uploaded.value)} objects
-`);
   if (!inputs.isDefaultBranch) {
     process.stdout.write(`cachet: not the default branch, so the lease is not renewed
 `);
