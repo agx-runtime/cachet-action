@@ -105,34 +105,57 @@ runs:
 
               host="$(printf '%s' "${CACHET_CACHE_URL}" | sed -e 's#^https\?://##' -e 's#/.*$##')"
 
-              # Determinate Nix re-synthesizes the netrc the daemon reads and re-sets netrc-file to point
-              # at it AFTER including nix.custom.conf, so a credential written into that synthesized file is
-              # wiped on the next daemon restart, and a netrc-file set in nix.custom.conf never wins. That
-              # is exactly why this job's cache reads were returning 401 and the build compiled the kernel
-              # from source instead of substituting it from cachet. determinate-nixd instead folds any file
-              # listed under authentication.additionalNetrcSources into the netrc it synthesizes and keeps
-              # it across restarts, so the credential is written to a file this step owns and registered
-              # there. This is the same mechanism scripts/cache-login.sh uses for a laptop.
-              netrc_path=/etc/nix/netrc
+              # The daemon that performs substitution reads only Determinate's synthesized netrc at
+              # /nix/var/determinate/netrc. Determinate hardcodes `netrc-file` to that path in
+              # /etc/nix/nix.conf AFTER the `!include nix.custom.conf` line, and `netrc-file` is a scalar
+              # that the later line overrides, so a netrc-file set in nix.custom.conf is silently dead
+              # (docs.determinate.systems, migrate-to-flakehub-cache). The supported way to add a
+              # credential is a real file — outside the Nix store, 0600, root-owned — registered under
+              # authentication.additionalNetrcSources, which Determinate merges into the synthesized netrc
+              # every time it synthesizes it.
+              netrc_source=/etc/nix/netrc
               printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                | sudo tee "${netrc_path}" >/dev/null
-              sudo chmod 600 "${netrc_path}"
+                | sudo tee "${netrc_source}" >/dev/null
+              sudo chmod 600 "${netrc_source}"
 
               det_config=/etc/determinate/config.json
               sudo mkdir -p /etc/determinate
               if [ -f "${det_config}" ]; then
                 # Merge with jq so a builder or garbageCollector section the runner already carries survives.
                 sudo cat "${det_config}" \
-                  | jq --arg s "${netrc_path}" '.authentication.additionalNetrcSources = ((.authentication.additionalNetrcSources // []) + [$s] | unique)' \
+                  | jq --arg s "${netrc_source}" '.authentication.additionalNetrcSources = ((.authentication.additionalNetrcSources // []) + [$s] | unique)' \
                   | sudo tee "${det_config}.tmp" >/dev/null
                 sudo mv "${det_config}.tmp" "${det_config}"
               else
-                printf '{"authentication":{"additionalNetrcSources":["%s"]}}\n' "${netrc_path}" \
+                printf '{"authentication":{"additionalNetrcSources":["%s"]}}\n' "${netrc_source}" \
                   | sudo tee "${det_config}" >/dev/null
               fi
 
-              # The substituter and trusted key belong in nix.custom.conf, which Determinate includes;
-              # netrc-file does not, because Determinate manages the netrc the daemon actually reads.
+              # Make the credential effective. A daemon restart re-synthesizes the merged netrc, and the
+              # label is systems.determinate.nix-daemon rather than org.nixos.nix-daemon — kickstarting the
+              # wrong one silently no-ops the change and reads exactly like flakiness. The nscloud runner
+              # images here have neither systemd nor launchd, so both restarts no-op; there the credential
+              # is written straight into the synthesized file the daemon reads. Nothing on this job
+              # regenerates that file afterwards, and config.json keeps the source registered so a later
+              # synthesis restores rather than drops it — so this is not the racy hand-edit the Determinate
+              # docs warn against. The earlier `determinate-nixd init` was the flaky part: it kicked off a
+              # synthesis that raced this write and wiped it on some cells but not others.
+              sudo systemctl restart nix-daemon.service 2>/dev/null \
+                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
+                || true
+              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
+              [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
+              if ! sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null; then
+                printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
+                  | sudo tee -a "${daemon_netrc}" >/dev/null
+              fi
+              echo "cachet: read credential in place at ${daemon_netrc}"
+
+              # Add the substituter and trusted key only now, after the credential is in place. Were cachet
+              # a substituter first, the daemon could query it once without auth, take a 401, and cache that
+              # miss in an in-memory negative cache that ignores narinfo-cache-negative-ttl and does not
+              # expire for the rest of the job — poisoning every subsequent lookup so the whole matrix
+              # rebuilds from source even after the credential lands.
               {
                 echo "extra-substituters = ${CACHET_CACHE_URL}"
                 if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
@@ -140,36 +163,6 @@ runs:
                 fi
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
-
-              # Apply the credential to the netrc the daemon actually reads, then verify it is there
-              # before the build runs. determinate-nixd combines authentication.additionalNetrcSources
-              # into that netrc when it synthesizes it, and `init` re-runs the synthesis on a runner with
-              # no systemd. That alone proved racy: some matrix cells received the credential and some did
-              # not, and a cell that did not silently recompiled from source a kernel cachet already held,
-              # because Nix reads a 401 as a cache miss and falls through to building. So this loop
-              # confirms the credential is present in the daemon's netrc, appends it directly when a
-              # synthesis dropped it, and the job fails loudly rather than waste an hour compiling what the
-              # cache could have served in a minute.
-              sudo determinate-nixd init 2>/dev/null || true
-              read_ready=0
-              for attempt in 1 2 3 4 5 6; do
-                daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
-                [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
-                if sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null; then
-                  read_ready=1
-                  break
-                fi
-                printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                  | sudo tee -a "${daemon_netrc}" >/dev/null 2>&1 || true
-                sleep 2
-              done
-              if [ "${read_ready}" != 1 ]; then
-                echo "cachet: could not place the cache read credential in the daemon netrc." >&2
-                echo "  Reads would return 401 and this job would compile from source instead of pulling" >&2
-                echo "  from cachet. Failing loudly rather than silently wasting the build." >&2
-                exit 1
-              fi
-              echo "cachet: daemon read credential verified in ${daemon_netrc}"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
