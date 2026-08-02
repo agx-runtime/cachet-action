@@ -131,31 +131,8 @@ runs:
                   | sudo tee "${det_config}" >/dev/null
               fi
 
-              # Make the credential effective. A daemon restart re-synthesizes the merged netrc, and the
-              # label is systems.determinate.nix-daemon rather than org.nixos.nix-daemon — kickstarting the
-              # wrong one silently no-ops the change and reads exactly like flakiness. The nscloud runner
-              # images here have neither systemd nor launchd, so both restarts no-op; there the credential
-              # is written straight into the synthesized file the daemon reads. Nothing on this job
-              # regenerates that file afterwards, and config.json keeps the source registered so a later
-              # synthesis restores rather than drops it — so this is not the racy hand-edit the Determinate
-              # docs warn against. The earlier `determinate-nixd init` was the flaky part: it kicked off a
-              # synthesis that raced this write and wiped it on some cells but not others.
-              sudo systemctl restart nix-daemon.service 2>/dev/null \
-                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
-                || true
-              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
-              [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
-              if ! sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null; then
-                printf 'machine %s login cachet password %s\n' "${host}" "${token}" \
-                  | sudo tee -a "${daemon_netrc}" >/dev/null
-              fi
-              echo "cachet: read credential in place at ${daemon_netrc}"
-
-              # Add the substituter and trusted key only now, after the credential is in place. Were cachet
-              # a substituter first, the daemon could query it once without auth, take a 401, and cache that
-              # miss in an in-memory negative cache that ignores narinfo-cache-negative-ttl and does not
-              # expire for the rest of the job — poisoning every subsequent lookup so the whole matrix
-              # rebuilds from source even after the credential lands.
+              # The substituter and trusted key belong in nix.custom.conf, which Determinate includes for
+              # the daemon. This goes in before the restart so the reload below also picks up the cache.
               {
                 echo "extra-substituters = ${CACHET_CACHE_URL}"
                 if [ -n "${CACHET_TRUSTED_PUBLIC_KEY}" ]; then
@@ -163,6 +140,36 @@ runs:
                 fi
               } | sudo tee -a /etc/nix/nix.custom.conf >/dev/null
               sudo chmod 644 /etc/nix/nix.custom.conf
+
+              # The daemon reads only Determinate's synthesized /nix/var/determinate/netrc and caches it, so
+              # writing the credential straight into that file does nothing — the daemon keeps its loaded
+              # copy and returns 401 (confirmed: a direct write landed but the build still compiled). The
+              # credential reaches the daemon only when Determinate re-synthesizes the file, merging the
+              # source registered above, and reloads. A daemon restart does that: systemctl or launchctl on
+              # a real system, and on the nscloud images here — which have neither — `determinate-nixd init`
+              # regenerates the merged netrc and reloads the daemon. The macOS label is
+              # systems.determinate.nix-daemon, not org.nixos.nix-daemon.
+              sudo systemctl restart nix-daemon.service 2>/dev/null \
+                || sudo launchctl kickstart -k system/systems.determinate.nix-daemon 2>/dev/null \
+                || sudo determinate-nixd init 2>/dev/null \
+                || true
+
+              # Wait for the re-synthesis to land the credential before the build substitutes. The restart
+              # is asynchronous, and starting before it finished is exactly what raced earlier: the build
+              # hit cachet unauthenticated, took a 401, and cached that miss in Nix's in-memory negative
+              # cache — which ignores narinfo-cache-negative-ttl and does not expire — so every path then
+              # rebuilt from source for the rest of the job. Polling until the credential is in the netrc
+              # the daemon reads removes the race; it is not a fail-loud check, it is waiting for an
+              # asynchronous restart to finish.
+              daemon_netrc="$(nix config show netrc-file 2>/dev/null || true)"
+              [ -n "${daemon_netrc}" ] || daemon_netrc=/nix/var/determinate/netrc
+              for _ in $(seq 1 60); do
+                sudo grep -qF "machine ${host} login cachet" "${daemon_netrc}" 2>/dev/null && break
+                sleep 1
+              done
+              probe_code="$(curl -s -o /dev/null -w '%{http_code}' --netrc-file "${daemon_netrc}" \
+                "${CACHET_CACHE_URL%/}/0000000000000000000000000000000a.narinfo" 2>/dev/null || echo 000)"
+              echo "cachet: read credential synthesized into ${daemon_netrc}; auth probe returned ${probe_code} (404 = authenticated, 401 = not)"
 
               # The signing key is written where only this runner can read it, and never leaves it (ADR 0004).
               key_file="${RUNNER_TEMP}/cachet-signing.key"
