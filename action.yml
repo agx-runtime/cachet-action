@@ -136,6 +136,27 @@ runs:
                   extra-substituters = ${{ inputs.cache-url }}
                   extra-trusted-public-keys = ${{ inputs.trusted-public-key }}
 
+        # Log out of FlakeHub, which the determinate-nix-action step above logged into on its own. On a
+        # runner granting id-token: write — which this action requires to mint its own cachet OIDC token —
+        # Determinate mints a second OIDC token for FlakeHub and logs in, and that login adds
+        # https://cache.flakehub.com to the daemon's active substituters. This deployment is not a FlakeHub
+        # Cache customer, so every narinfo lookup then answers 401 ("User is not authorized for this
+        # resource") before it falls through to cachet: an error-level log line and a wasted round trip on
+        # every request, on a build that still succeeds. Logging out returns the substituter set to the
+        # logged-out state, in which cache.flakehub.com is absent — verified against a local Determinate
+        # install, where `determinate-nixd status` reports logged-out and `nix config show substituters`
+        # omits FlakeHub. cachet's own read credential is the netrc merged from additionalNetrcSources and
+        # is independent of the FlakeHub login, so the Configure step's auth probe below still reports 404.
+        - name: Log out of FlakeHub Cache, which this deployment does not use
+          shell: bash
+          run: |
+              set -euo pipefail
+              # `|| true`: a job without id-token never logged in, so logout is a no-op there rather than a
+              # failure, and this action must not fail a build over a cache it does not even use.
+              sudo determinate-nixd auth logout || true
+              echo "cachet: FlakeHub login status after logout:"
+              sudo determinate-nixd status || true
+
         - name: Configure cachet
           shell: bash
           env:
