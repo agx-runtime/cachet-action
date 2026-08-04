@@ -242,4 +242,4 @@ runs:
         # 'action.yml' under .../post". Naming the repository resolves the nested action independently of
         # where the consumer checked out. It is pinned to the v1 major tag, which every release in the 1.x
         # line moves forward, so the composite and its post action always come from the same line.
-        - uses: agx-runtime/cachet-action/post@v1
+        - uses: agx-runtime/cachet-action/post@v1.0.11
