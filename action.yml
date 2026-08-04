@@ -124,7 +124,7 @@ runs:
               echo "cachet: read credential provisioned before Determinate starts"
 
         # Determinate Nix is the one distribution everywhere, including on laptops (ADR 0008).
-        - uses: DeterminateSystems/determinate-nix-action@v3.21.8
+        - uses: DeterminateSystems/determinate-nix-action@v3.21.9
           with:
               # Add the cache and its trusted key at install time, so the daemon starts already knowing
               # them. Adding them afterwards in the Configure step proved ineffective — the daemon never
